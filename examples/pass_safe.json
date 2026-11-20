@@ -1,0 +1,9 @@
+{
+  "target": "T",
+  "links": [
+    {"a": "T", "b": "A", "old_cost": 1, "new_cost": 1},
+    {"a": "T", "b": "B", "old_cost": 2, "new_cost": 2},
+    {"a": "A", "b": "B", "old_cost": 1, "new_cost": 1}
+  ],
+  "batches": [["A"], ["B"], ["T"]]
+}

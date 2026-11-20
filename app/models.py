@@ -2,9 +2,257 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
 
 MAX_BATCH_SIZE = 50
+MAX_PROBES_PER_ROUND = 5000
+
+
+class RoundLink(BaseModel):
+    """诊断轮登记的固定链路：端点与新版正整数代价（探针按此代价走最短路）。"""
+
+    a: str = Field(..., description="路由器 A 标识")
+    b: str = Field(..., description="路由器 B 标识")
+    new_cost: int = Field(..., ge=1, description="新版链路代价（正整数）")
+
+
+class ProbeInput(BaseModel):
+    """单条探针记录：编号、起点、按顺序采到的路由器（允许漏采）与送达结果。"""
+
+    probe_id: str = Field(..., min_length=1, max_length=128, description="探针编号")
+    source: str = Field(..., min_length=1, description="探针起点路由器")
+    captured: list[str] = Field(
+        default_factory=list,
+        description="沿途按顺序采到探针的路由器；允许漏采，不能重复",
+    )
+    result: Literal["delivered", "lost"] = Field(
+        ..., description="delivered = 送达；lost = 丢失"
+    )
+
+    @model_validator(mode="after")
+    def _validate_id(self) -> "ProbeInput":
+        if not self.probe_id.strip():
+            raise ValueError("探针编号不能为空")
+        return self
+
+
+class ProbeCorrection(BaseModel):
+    """按编号更正一条探针记录（编号在路径中给出）。"""
+
+    source: str = Field(..., min_length=1, description="探针起点路由器")
+    captured: list[str] = Field(
+        default_factory=list,
+        description="沿途按顺序采到探针的路由器；允许漏采，不能重复",
+    )
+    result: Literal["delivered", "lost"] = Field(
+        ..., description="delivered = 送达；lost = 丢失"
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "source": "S",
+                    "captured": ["B"],
+                    "result": "lost",
+                }
+            ]
+        }
+    }
+
+
+class RoundCreateRequest(BaseModel):
+    """登记一轮诊断：固定拓扑、新版链路代价、共同目的路由器，可选附带初始记录。"""
+
+    target: str = Field(..., min_length=1, description="共同目的路由器标识")
+    links: list[RoundLink] = Field(..., min_length=1, description="固定拓扑的双向链路")
+    probes: list[ProbeInput] = Field(
+        default_factory=list,
+        max_length=MAX_PROBES_PER_ROUND,
+        description="可选的初始探针记录",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "target": "T",
+                    "links": [
+                        {"a": "S", "b": "T", "new_cost": 2},
+                        {"a": "S", "b": "A", "new_cost": 1},
+                        {"a": "A", "b": "T", "new_cost": 1},
+                        {"a": "S", "b": "B", "new_cost": 1},
+                        {"a": "B", "b": "T", "new_cost": 1},
+                    ],
+                    "probes": [
+                        {
+                            "probe_id": "P-001",
+                            "source": "S",
+                            "captured": ["A"],
+                            "result": "lost",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    @model_validator(mode="after")
+    def _validate(self) -> "RoundCreateRequest":
+        _validate_round_links(self.links, self.target)
+
+        nodes = {lk.a for lk in self.links} | {lk.b for lk in self.links}
+        if len(self.probes) > MAX_PROBES_PER_ROUND:
+            raise ValueError(f"单轮最多登记 {MAX_PROBES_PER_ROUND} 条探针")
+        seen: set[str] = set()
+        for probe in self.probes:
+            validate_probe_against_nodes(probe, nodes)
+            if probe.probe_id in seen:
+                raise ValueError(f"探针编号 {probe.probe_id} 重复")
+            seen.add(probe.probe_id)
+        return self
+
+
+def _validate_round_links(links: list[RoundLink], target: str) -> None:
+    if not target or not target.strip():
+        raise ValueError("target 不能为空")
+    nodes: set[str] = set()
+    pairs: set[frozenset[str]] = set()
+    for lk in links:
+        if not lk.a or not lk.a.strip() or not lk.b or not lk.b.strip():
+            raise ValueError("链路端点标识不能为空")
+        if lk.a == lk.b:
+            raise ValueError(f"不允许自环链路：{lk.a}")
+        pair = frozenset((lk.a, lk.b))
+        if pair in pairs:
+            raise ValueError(f"链路 {lk.a} <-> {lk.b} 重复定义")
+        pairs.add(pair)
+        nodes.add(lk.a)
+        nodes.add(lk.b)
+    if target not in nodes:
+        raise ValueError(f"目标路由器 {target} 不在拓扑中")
+
+
+def validate_probe_against_nodes(probe: ProbeInput | ProbeCorrection, nodes: set[str]) -> None:
+    if not probe.source or not probe.source.strip():
+        raise ValueError("探针起点不能为空")
+    if probe.source not in nodes:
+        raise ValueError(f"探针起点 {probe.source} 不在拓扑中")
+    if len(set(probe.captured)) != len(probe.captured):
+        raise ValueError("已采路由器不能重复（探针沿最短路径不会重复经过路由器）")
+    for router in probe.captured:
+        if not router or not router.strip():
+            raise ValueError("已采路由器标识不能为空")
+        if router not in nodes:
+            raise ValueError(f"已采路由器 {router} 不在拓扑中")
+
+
+class ProbeRecordOut(BaseModel):
+    probe_id: str
+    source: str
+    captured: list[str]
+    result: Literal["delivered", "lost"]
+
+
+class CandidateDirectionOut(BaseModel):
+    from_router: str = Field(..., description="丢包方向的起点")
+    to_router: str = Field(..., description="丢包方向的终点")
+
+
+class RoundLinkOut(BaseModel):
+    a: str
+    b: str
+    new_cost: int
+
+
+class DiagnosisResponse(BaseModel):
+    round_id: str
+    target: str
+    links: list[RoundLinkOut] = Field(..., description="本轮固定的拓扑与新版代价")
+    status: Literal["collect_more", "diagnosed", "conflict"] = Field(
+        ...,
+        description=(
+            "collect_more = 尚无丢包，继续取证；"
+            "diagnosed = 找到候选方向；"
+            "conflict = 有丢包但无候选，证据冲突"
+        ),
+    )
+    message: str
+    records_total: int
+    delivered_count: int
+    lost_count: int
+    evaluated_directions: int = Field(..., description="本轮枚举过的有向链路数（2E）")
+    candidates: list[CandidateDirectionOut] = Field(
+        ..., description="能解释全部记录的有向链路；冲突或取证中为空"
+    )
+    records: list[ProbeRecordOut] = Field(..., description="按登记顺序返回的全部记录")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "round_id": "0f3a9c2b71de",
+                    "target": "T",
+                    "links": [
+                        {"a": "S", "b": "T", "new_cost": 2},
+                        {"a": "S", "b": "A", "new_cost": 1},
+                        {"a": "A", "b": "T", "new_cost": 1},
+                        {"a": "S", "b": "B", "new_cost": 1},
+                        {"a": "B", "b": "T", "new_cost": 1},
+                    ],
+                    "status": "diagnosed",
+                    "message": "找到 1 个能解释全部记录的有向链路。",
+                    "records_total": 1,
+                    "delivered_count": 0,
+                    "lost_count": 1,
+                    "evaluated_directions": 10,
+                    "candidates": [{"from_router": "A", "to_router": "T"}],
+                    "records": [
+                        {
+                            "probe_id": "P-001",
+                            "source": "S",
+                            "captured": ["A"],
+                            "result": "lost",
+                        }
+                    ],
+                },
+                {
+                    "round_id": "0f3a9c2b71de",
+                    "target": "T",
+                    "links": [
+                        {"a": "S", "b": "T", "new_cost": 2},
+                        {"a": "S", "b": "A", "new_cost": 1},
+                        {"a": "A", "b": "T", "new_cost": 1},
+                        {"a": "S", "b": "B", "new_cost": 1},
+                        {"a": "B", "b": "T", "new_cost": 1},
+                    ],
+                    "status": "conflict",
+                    "message": "证据冲突：存在丢包记录，但没有有向链路能解释全部记录；记录已保留，候选已撤下。",
+                    "records_total": 2,
+                    "delivered_count": 1,
+                    "lost_count": 1,
+                    "evaluated_directions": 10,
+                    "candidates": [],
+                    "records": [
+                        {
+                            "probe_id": "P-001",
+                            "source": "S",
+                            "captured": ["A"],
+                            "result": "lost",
+                        },
+                        {
+                            "probe_id": "P-002",
+                            "source": "S",
+                            "captured": ["A"],
+                            "result": "delivered",
+                        },
+                    ],
+                },
+            ]
+        }
+    }
 
 
 class Link(BaseModel):

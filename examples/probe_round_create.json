@@ -1,0 +1,13 @@
+{
+  "target": "T",
+  "links": [
+    {"a": "S", "b": "T", "new_cost": 2},
+    {"a": "S", "b": "A", "new_cost": 1},
+    {"a": "A", "b": "T", "new_cost": 1},
+    {"a": "S", "b": "B", "new_cost": 1},
+    {"a": "B", "b": "T", "new_cost": 1}
+  ],
+  "probes": [
+    {"probe_id": "P-001", "source": "S", "captured": ["A"], "result": "lost"}
+  ]
+}

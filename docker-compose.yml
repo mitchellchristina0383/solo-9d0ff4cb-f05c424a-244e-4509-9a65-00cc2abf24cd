@@ -3,6 +3,10 @@ services:
     build: .
     image: link-cost-precheck:latest
     container_name: link-cost-precheck
+    environment:
+      DIAGNOSIS_STORE_PATH: /data/diagnosis.json
+    volumes:
+      - diagnosis-data:/data
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -12,3 +16,6 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+
+volumes:
+  diagnosis-data:
